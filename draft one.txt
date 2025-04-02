@@ -3,207 +3,189 @@
 #include <Adafruit_BME680.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <DHT.h>
+#include "DHT.h"
 #include <BH1750.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <SDS011.h>
 
-// **Sensor & Display Definitions**
-#define DHTPIN 2          // DHT11 Sensor Pin
-#define DHTTYPE DHT11     // DHT Type
+#define DHTPIN 2
+#define DHTTYPE DHT11
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 32
 #define OLED_RESET -1
-#define SCREEN_ADDRESS 0x3C  // OLED I2C Address
-#define AIR_QUALITY_PIN 34   // Analog Air Quality Sensor Pin
-#define RELAY_FAN_PIN 26     // Fan Relay
-#define RELAY_HUMID_PIN 27   // Humidifier Relay
+#define SCREEN_ADDRESS 0x3C
 
-// **Initialize Sensors**
-DHT dht(DHTPIN, DHTTYPE);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-BH1750 lightSensor;
-SDS011 sds;
 WiFiClient espClient;
 PubSubClient client(espClient);
+DHT dht(DHTPIN, DHTTYPE);
+BH1750 lightSensor;
+SDS011 sds;
 
-// **Wi-Fi Credentials**
+const int relayFanPin = 26;
+const int relayHumidPin = 27;
+const int aqltPin = 34;
+int airStatus;
+
 const char* ssid = "Exploratory2";
 const char* password = "!tggs2025";
-
-// **MQTT Broker Settings**
 const char* mqttServer = "202.44.44.233";
 const int mqttPort = 1883;
-const char* mqttTopic = "kerk/json";  
-
-// **Global Variables**
-float temperature, humidity, lux, pm25, pm10;
-int airQualityStatus = LOW;
+const char* mqttTopic = "kerk/json";
 
 void setup() {
     Serial.begin(115200);
-
-    // **Initialize Components**
-    WiFiSetup();
     MQTTSetup();
+    pinMode(relayFanPin, OUTPUT);
+    pinMode(relayHumidPin, OUTPUT);
+    pinMode(aqltPin, INPUT);
     lightSetup();
     dht.begin();
-    airQualitySetup();
     PMSetup();
     oledSetup();
-
-    // **Relay Setup**
-    pinMode(RELAY_FAN_PIN, OUTPUT);
-    pinMode(RELAY_HUMID_PIN, OUTPUT);
 }
 
 void loop() {
-    readLightSensor();
-    readDHT11();
-    readAirQuality();
-    readPM2_5();
-    displayOLED();
+    lightLoop();
+    hNtLoop();
+    aqltLoop();
+    PMLoop();
+    oledLoop();
     MQTTLoop();
     delay(1000);
 }
 
-/* === Wi-Fi Setup === */
-void WiFiSetup() {
+void lightSetup() {
+    Wire.begin();
+    if (lightSensor.begin()) {
+        Serial.println("BH1750 sensor initialized successfully.");
+    } else {
+        Serial.println("Error: Failed to initialize BH1750 sensor.");
+        while (1);
+    }
+}
+
+void lightLoop() {
+    float lux = lightSensor.readLightLevel();
+    Serial.print("Light Level: ");
+    Serial.print(lux);
+    Serial.println(" lux");
+}
+
+void hNtLoop() {
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    
+    if (!isnan(temperature) && !isnan(humidity)) {
+        Serial.print("Temperature: ");
+        Serial.print(temperature);
+        Serial.print(" °C\tHumidity: ");
+        Serial.print(humidity);
+        Serial.println(" %");
+    } else {
+        Serial.println("Failed to read DHT sensor!");
+    }
+}
+
+void aqltLoop() {
+    airStatus = digitalRead(aqltPin);
+    if (airStatus == HIGH) {
+        Serial.println("Poor Air Quality");
+    } else {
+        Serial.println("Good Air Quality");
+    }
+}
+
+void oledSetup() {
+    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+        Serial.println(F("SSD1306 allocation failed"));
+        for (;;);
+    }
+    display.clearDisplay();
+}
+
+void oledLoop() {
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    airStatus = digitalRead(aqltPin);
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.printf("Temp: %.1fC\n", temperature);
+    display.printf("Humidity: %.1f%%\n", humidity);
+    display.printf("Air: %s\n", airStatus == HIGH ? "Poor" : "Good");
+    display.display();
+}
+
+void PMSetup() {
+    Serial2.begin(9600, SERIAL_8N1, 16, 17);
+    sds.begin(&Serial2);
+    Serial.println("SDS011 Sensor Test Started...");
+    delay(2000);
+}
+
+void PMLoop() {
+    float pm25 = 0, pm10 = 0;
+    if (sds.read(&pm25, &pm10) == 0) {
+        Serial.printf("PM2.5: %.2f µg/m^3, PM10: %.2f µg/m^3\n", pm25, pm10);
+    } else {
+        Serial.println("Failed to read SDS011 Sensor.");
+    }
+}
+
+void MQTTSetup() {
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
         delay(1000);
         Serial.println("Connecting to WiFi...");
     }
     Serial.println("Connected to Wi-Fi");
-}
-
-/* === Light Sensor (BH1750) === */
-void lightSetup() {
-    Wire.begin();  
-    if (lightSensor.begin()) {
-        Serial.println("BH1750 sensor initialized.");
-    } else {
-        Serial.println("Error initializing BH1750 sensor.");
-        while (1);
-    }
-}
-
-void readLightSensor() {
-    lux = lightSensor.readLightLevel();
-    Serial.print("Light Level: ");
-    Serial.print(lux);
-    Serial.println(" lux");
-}
-
-/* === Temperature & Humidity Sensor (DHT11) === */
-void readDHT11() {
-    temperature = dht.readTemperature();
-    humidity = dht.readHumidity();
-    if (isnan(temperature) || isnan(humidity)) {
-        Serial.println("Failed to read from DHT sensor!");
-    } else {
-        Serial.print("Temperature: ");
-        Serial.print(temperature);
-        Serial.print(" °C | Humidity: ");
-        Serial.print(humidity);
-        Serial.println(" %");
-    }
-}
-
-/* === Air Quality Sensor === */
-void airQualitySetup() {
-    pinMode(AIR_QUALITY_PIN, INPUT);
-}
-
-void readAirQuality() {
-    airQualityStatus = digitalRead(AIR_QUALITY_PIN);
-    Serial.println(airQualityStatus == HIGH ? "Poor Air Quality" : "Good Air Quality");
-}
-
-/* === PM2.5 Sensor (SDS011) === */
-void PMSetup() {
-    Serial2.begin(9600, SERIAL_8N1, 16, 17);
-    sds.begin(&Serial2);
-    Serial.println("SDS011 Sensor Initialized...");
-}
-
-void readPM2_5() {
-    if (sds.read(&pm25, &pm10) == 0) {
-        Serial.printf("PM2.5: %.2f µg/m³, PM10: %.2f µg/m³\n", pm25, pm10);
-    } else {
-        Serial.println("Failed to read SDS011 sensor.");
-    }
-}
-
-/* === OLED Display === */
-void oledSetup() {
-    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-        Serial.println("OLED initialization failed");
-        while (1);
-    }
-    display.clearDisplay();
-}
-
-void displayOLED() {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-
-    display.printf("Temp: %.1fC\nHumidity: %.1f%%\nLight: %.1flux\n", temperature, humidity, lux);
-    display.printf("PM2.5: %.1f µg/m³\nAir: %s", pm25, airQualityStatus == HIGH ? "Poor" : "Good");
-
-    display.display();
-}
-
-/* === MQTT Communication === */
-void MQTTSetup() {
     client.setServer(mqttServer, mqttPort);
-    while (!client.connected()) {
-        Serial.println("Connecting to MQTT...");
-        String client_id = "esp32-client-" + String(WiFi.macAddress());
-        if (client.connect(client_id.c_str())) {
-            Serial.println("Connected to MQTT");
-        } else {
-            Serial.println("Retrying MQTT...");
-            delay(5000);
-        }
-    }
+    reconnect();
 }
 
 void MQTTLoop() {
-    if (!client.connected()) reconnect();
+    if (!client.connected()) {
+        reconnect();
+    }
     client.loop();
+    
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    float lux = lightSensor.readLightLevel();
+    float pm25 = 0, pm10 = 0;
+    sds.read(&pm25, &pm10);
+    airStatus = digitalRead(aqltPin);
 
-    // Create JSON payload
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<200> doc;
     doc["temperature"] = temperature;
     doc["humidity"] = humidity;
-    doc["airQuality"] = airQualityStatus;
+    doc["airquality"] = airStatus;
     doc["light"] = lux;
     doc["PM2.5"] = pm25;
 
-    // Convert JSON to string and publish
-    char jsonBuffer[256];
+    char jsonBuffer[512];
     serializeJson(doc, jsonBuffer);
+    
     if (client.publish(mqttTopic, jsonBuffer)) {
         Serial.println("Data published successfully");
     } else {
-        Serial.println("Failed to publish data.");
+        Serial.println("Failed to publish data");
     }
 }
 
-// MQTT Reconnection
 void reconnect() {
     while (!client.connected()) {
-        Serial.println("Reconnecting MQTT...");
+        Serial.print("Attempting MQTT connection...");
         String client_id = "esp32-client-" + String(WiFi.macAddress());
         if (client.connect(client_id.c_str())) {
-            Serial.println("Reconnected to MQTT");
+            Serial.println("Connected to MQTT broker");
         } else {
-            Serial.println("MQTT Reconnect failed. Retrying...");
+            Serial.print("Failed to connect. Retrying in 5 seconds...");
             delay(5000);
         }
     }
